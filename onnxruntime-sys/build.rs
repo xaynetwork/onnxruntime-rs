@@ -417,8 +417,15 @@ fn prepare_libort_dir() -> PathBuf {
             .map(String::as_str)
             .unwrap_or_else(|_| "unknown")
     );
+
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("Failed to get TARGET_OS");
+
     match strategy.as_ref().map(String::as_str) {
-        Ok("download") | Err(_) => prepare_libort_dir_prebuilt(),
+        Err(_) => match os.as_str() {
+            "android" => compile::compile(),
+            _ => prepare_libort_dir_prebuilt(),
+        },
+        Ok("download") => prepare_libort_dir_prebuilt(),
         Ok("system") => PathBuf::from(match env::var(ORT_ENV_SYSTEM_LIB_LOCATION) {
             Ok(p) => p,
             Err(e) => {
@@ -428,7 +435,299 @@ fn prepare_libort_dir() -> PathBuf {
                 );
             }
         }),
-        Ok("compile") => unimplemented!(),
+        Ok("compile") => compile::compile(),
         _ => panic!("Unknown value for {:?}", ORT_ENV_STRATEGY),
+    }
+}
+
+pub mod compile {
+    use std::{env, fs, path::PathBuf, process::Command, str::FromStr};
+
+    use git2::{ErrorCode, Repository};
+
+    use crate::{ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
+
+    pub fn compile() -> PathBuf {
+        let workdir = prepare_git_repository();
+        build_target(&workdir)
+    }
+
+    fn prepare_git_repository() -> PathBuf {
+        const REPO_URL: &str = "https://github.com/microsoft/onnxruntime";
+
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let workdir = out_dir.join(format!("{}-git", ORT_PREBUILT_EXTRACT_DIR));
+
+        let repo = match Repository::clone(REPO_URL, &workdir) {
+            Ok(repo) => repo,
+            Err(err) if err.code() == ErrorCode::Exists => {
+                Repository::open(&workdir).expect("Failed to open repository")
+            }
+            Err(err) => panic!("Failed to clone repository: {:?}", err),
+        };
+
+        let (object, reference) = repo
+            .revparse_ext(&format!("v{}", ORT_VERSION))
+            .expect("Object not found");
+
+        repo.checkout_tree(&object, None)
+            .expect("Failed to checkout");
+
+        match reference {
+            // gref is an actual reference like branches or tags
+            Some(gref) => repo.set_head(gref.name().unwrap()),
+            // this is a commit, not a reference
+            None => repo.set_head_detached(object.id()),
+        }
+        .expect("Failed to set HEAD");
+
+        repo.workdir()
+            .expect("Failed to get working directory of repository")
+            .into()
+    }
+
+    fn build_target(workdir: &PathBuf) -> PathBuf {
+        let os = env::var("CARGO_CFG_TARGET_OS")
+            .map(|s| OS::from_str(&s))
+            .expect("Failed to get TARGET_OS")
+            .expect("Failed to get TARGET_OS");
+
+        let arch = env::var("CARGO_CFG_TARGET_ARCH")
+            .map(|s| Arch::from_str(&s))
+            .expect("Failed to get TARGET_ARCH")
+            .expect("Failed to get TARGET_ARCH");
+
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let release_dir = out_dir.join(format!("{}-release", ORT_PREBUILT_EXTRACT_DIR));
+        let version_dir = release_dir.join(format!(
+            "{}-{}-v{}",
+            os.to_string(),
+            arch.to_string(),
+            ORT_VERSION
+        ));
+
+        build_android(workdir, &version_dir, &arch);
+        version_dir
+    }
+
+    fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
+        let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
+        let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
+
+        #[cfg(target_os = "macos")]
+        const HOST_ARCH: &str = "darwin-x86_64";
+        #[cfg(target_os = "linux")]
+        const HOST_ARCH: &str = "linux-x86_64";
+
+        // copied from cargo-ndk to prevent errors like:
+        // onnxruntime-rs/target/aarch64-linux-android/debug/build/onnxruntime-sys-80e652991449e5bd/out/onnxruntime-release/android-aarch64-v1.8.1/include/onnxruntime_c_api.h:5:10: fatal error: 'stdlib.h' file not found
+        // we might not need this if we run it with cargo ndk
+
+        let sysroot_dir = PathBuf::from(&ndk)
+            .join("toolchains")
+            .join("llvm")
+            .join("prebuilt")
+            .join(HOST_ARCH)
+            .join("sysroot");
+
+        let extra_include = format!(
+            "{}/usr/include/{}",
+            &sysroot_dir.display(),
+            arch.as_android_triple()
+        );
+
+        std::env::set_var(
+            format!(
+                "BINDGEN_EXTRA_CLANG_ARGS_{}",
+                arch.as_android_triple().replace('-', "_")
+            ),
+            format!("--sysroot={} -I{}", sysroot_dir.display(), extra_include),
+        );
+
+        if !version_dir.exists() {
+            let status = Command::new("sh")
+                .current_dir(&workdir)
+                .arg("build.sh")
+                .arg("--android")
+                .arg("--android_sdk_path")
+                .arg(sdk)
+                .arg("--android_ndk_path")
+                .arg(ndk)
+                .arg("--android_abi")
+                .arg(arch.as_android_arch())
+                .arg("--parallel")
+                .arg("0")
+                .arg("--build_shared_lib")
+                .arg("--config")
+                .arg("Release")
+                .status()
+                .expect("Process failed to execute");
+            if !status.success() {
+                panic!(
+                    "Failed to build android library for target {}",
+                    arch.to_string()
+                )
+            }
+            mimic_release_package(workdir, version_dir, &OS::Android);
+        }
+    }
+
+    fn mimic_release_package(workdir: &PathBuf, version_dir: &PathBuf, os: &OS) {
+        fs::create_dir_all(version_dir).expect("Failed to create release directory");
+        let build_dir = workdir
+            .join("build")
+            .join(os.as_build_name())
+            .join("Release");
+
+        let lib_target_dir = version_dir.join("lib");
+        fs::create_dir(&lib_target_dir).unwrap();
+        fs::copy(
+            build_dir.join("libonnxruntime.so"),
+            lib_target_dir.join("libonnxruntime.so"),
+        )
+        .unwrap();
+
+        // https://github.com/microsoft/onnxruntime/blob/f2ca43fe0d6ab1156bb43128e76c283bd21e46c5/tools/ci_build/github/linux/copy_strip_binary.sh
+        let include_target_dir = version_dir.join("include");
+        fs::create_dir(&include_target_dir).unwrap();
+
+        let include_source_base = workdir.join("include").join("onnxruntime").join("core");
+        fs::copy(
+            include_source_base
+                .join("session")
+                .join("onnxruntime_c_api.h"),
+            include_target_dir.join("onnxruntime_c_api.h"),
+        )
+        .unwrap();
+        fs::copy(
+            include_source_base
+                .join("session")
+                .join("onnxruntime_cxx_api.h"),
+            include_target_dir.join("onnxruntime_cxx_api.h"),
+        )
+        .unwrap();
+        fs::copy(
+            include_source_base
+                .join("session")
+                .join("onnxruntime_cxx_inline.h"),
+            include_target_dir.join("onnxruntime_cxx_inline.h"),
+        )
+        .unwrap();
+        fs::copy(
+            include_source_base
+                .join("providers")
+                .join("cpu")
+                .join("cpu_provider_factory.h"),
+            include_target_dir.join("cpu_provider_factory.h"),
+        )
+        .unwrap();
+        fs::copy(
+            include_source_base
+                .join("session")
+                .join("onnxruntime_session_options_config_keys.h"),
+            include_target_dir.join("onnxruntime_session_options_config_keys.h"),
+        )
+        .unwrap();
+        fs::copy(
+            include_source_base
+                .join("session")
+                .join("onnxruntime_run_options_config_keys.h"),
+            include_target_dir.join("onnxruntime_run_options_config_keys.h"),
+        )
+        .unwrap();
+        fs::copy(
+            include_source_base
+                .join("framework")
+                .join("provider_options.h"),
+            include_target_dir.join("provider_options.h"),
+        )
+        .unwrap();
+    }
+
+    #[allow(non_camel_case_types)]
+    enum OS {
+        Android,
+    }
+
+    impl ToString for OS {
+        fn to_string(&self) -> String {
+            match self {
+                OS::Android => "android",
+            }
+            .to_string()
+        }
+    }
+
+    impl FromStr for OS {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "android" => Ok(OS::Android),
+                _ => Err(format!("unsupported os: {}", s)),
+            }
+        }
+    }
+
+    impl OS {
+        fn as_build_name(&self) -> &str {
+            match self {
+                OS::Android => "Android",
+            }
+        }
+    }
+
+    #[allow(non_camel_case_types)]
+    enum Arch {
+        x86,
+        x86_64,
+        arm,
+        aarch64,
+    }
+
+    impl ToString for Arch {
+        fn to_string(&self) -> String {
+            match &self {
+                Arch::x86 => "x86",
+                Arch::x86_64 => "x86_64",
+                Arch::arm => "arm",
+                Arch::aarch64 => "aarch64",
+            }
+            .to_string()
+        }
+    }
+
+    impl FromStr for Arch {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                "x86" => Ok(Arch::x86),
+                "x86_64" => Ok(Arch::x86_64),
+                "arm" => Ok(Arch::arm),
+                "aarch64" => Ok(Arch::aarch64),
+                _ => Err(format!("unsupported arch: {}", s)),
+            }
+        }
+    }
+
+    impl Arch {
+        fn as_android_arch(&self) -> &str {
+            match self {
+                Arch::x86 => "x86",
+                Arch::x86_64 => "x86_64",
+                Arch::arm => "armeabi-v7a",
+                Arch::aarch64 => "arm64-v8a",
+            }
+        }
+
+        fn as_android_triple(&self) -> &str {
+            match self {
+                Arch::x86 => "i686-linux-android",
+                Arch::x86_64 => "x86_64-linux-android",
+                Arch::arm => "arm-linux-androideabi",
+                Arch::aarch64 => "aarch64-linux-android",
+            }
+        }
     }
 }
