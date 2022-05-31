@@ -78,7 +78,7 @@ fn generate_bindings(_include_dir: &Path) {
 
 #[cfg(feature = "generate-bindings")]
 fn generate_bindings(include_dir: &Path) {
-    let clang_args = &[
+    let mut clang_args = vec![
         format!("-I{}", include_dir.display()),
         format!(
             "-I{}",
@@ -93,6 +93,45 @@ fn generate_bindings(include_dir: &Path) {
     // Tell cargo to invalidate the built crate whenever the wrapper changes
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=src/generated/bindings.rs");
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
+    match target_os.as_str() {
+        "android" => {
+            let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
+
+            #[cfg(target_os = "macos")]
+            const HOST_ARCH: &str = "darwin-x86_64";
+            #[cfg(target_os = "linux")]
+            const HOST_ARCH: &str = "linux-x86_64";
+
+            // copied from https://github.com/chertov/onnxruntime-rs/commit/4be4f7f20cc1e79fabc386e94b10466844cc1f99 to prevent errors like:
+            // onnxruntime-rs/target/aarch64-linux-android/debug/build/onnxruntime-sys-80e652991449e5bd/out/onnxruntime-release/android-aarch64-v1.8.1/include/onnxruntime_c_api.h:5:10: fatal error: 'stdlib.h' file not found
+            // we might not need this if we run it with cargo ndk
+
+            let sysroot_dir = PathBuf::from(&ndk)
+                .join("toolchains")
+                .join("llvm")
+                .join("prebuilt")
+                .join(HOST_ARCH)
+                .join("sysroot");
+
+            let ndk_include = format!("{}/usr/include", sysroot_dir.display());
+            let ndk_target = match target_arch.as_str() {
+                "x86" => "i686-linux-android",
+                "x86_64" => "x86_64-linux-android",
+                "arm" => "arm-linux-androideabi",
+                "aarch64" => "aarch64-linux-android",
+                target => panic!("Unknown android target '{}'", target),
+            };
+            let ndk_target_include = format!("{}/{}", ndk_include, ndk_target);
+
+            clang_args.push(format!("-I{}", ndk_include));
+            clang_args.push(format!("-I{}", ndk_target_include));
+        }
+        _ => {}
+    }
 
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
@@ -422,7 +461,7 @@ fn prepare_libort_dir() -> PathBuf {
 
     match strategy.as_ref().map(String::as_str) {
         Err(_) => match os.as_str() {
-            "android" => compile::compile(),
+            "android" => android::compile(),
             _ => prepare_libort_dir_prebuilt(),
         },
         Ok("download") => prepare_libort_dir_prebuilt(),
@@ -435,12 +474,12 @@ fn prepare_libort_dir() -> PathBuf {
                 );
             }
         }),
-        Ok("compile") => compile::compile(),
+        Ok("compile") => android::compile(),
         _ => panic!("Unknown value for {:?}", ORT_ENV_STRATEGY),
     }
 }
 
-pub mod compile {
+pub mod android {
     use std::{env, fs, path::PathBuf, process::Command, str::FromStr};
 
     use git2::{ErrorCode, Repository};
@@ -497,52 +536,27 @@ pub mod compile {
             .expect("Failed to get TARGET_ARCH")
             .expect("Failed to get TARGET_ARCH");
 
+        // default for cargo ndk is 21 but for the build script it is 27
+        // both need to be the same otherwise linking might fail
+        let api_level = 21;
+
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let release_dir = out_dir.join(format!("{}-release", ORT_PREBUILT_EXTRACT_DIR));
         let version_dir = release_dir.join(format!(
-            "{}-{}-v{}",
+            "{}-{}-lvl-{}-v{}",
             os.to_string(),
             arch.to_string(),
+            api_level,
             ORT_VERSION
         ));
 
-        build_android(workdir, &version_dir, &arch);
+        build_android(workdir, &version_dir, &arch, api_level);
         version_dir
     }
 
-    fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
+    fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch, api_level: u32) {
         let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
         let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
-
-        #[cfg(target_os = "macos")]
-        const HOST_ARCH: &str = "darwin-x86_64";
-        #[cfg(target_os = "linux")]
-        const HOST_ARCH: &str = "linux-x86_64";
-
-        // copied from cargo-ndk to prevent errors like:
-        // onnxruntime-rs/target/aarch64-linux-android/debug/build/onnxruntime-sys-80e652991449e5bd/out/onnxruntime-release/android-aarch64-v1.8.1/include/onnxruntime_c_api.h:5:10: fatal error: 'stdlib.h' file not found
-        // we might not need this if we run it with cargo ndk
-
-        let sysroot_dir = PathBuf::from(&ndk)
-            .join("toolchains")
-            .join("llvm")
-            .join("prebuilt")
-            .join(HOST_ARCH)
-            .join("sysroot");
-
-        let extra_include = format!(
-            "{}/usr/include/{}",
-            &sysroot_dir.display(),
-            arch.as_android_triple()
-        );
-
-        std::env::set_var(
-            format!(
-                "BINDGEN_EXTRA_CLANG_ARGS_{}",
-                arch.as_android_triple().replace('-', "_")
-            ),
-            format!("--sysroot={} -I{}", sysroot_dir.display(), extra_include),
-        );
 
         if !version_dir.exists() {
             let status = Command::new("sh")
@@ -555,6 +569,8 @@ pub mod compile {
                 .arg(ndk)
                 .arg("--android_abi")
                 .arg(arch.as_android_arch())
+                .arg("--android_api")
+                .arg(api_level.to_string())
                 .arg("--parallel")
                 .arg("0")
                 .arg("--build_shared_lib")
