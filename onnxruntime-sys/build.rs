@@ -34,6 +34,10 @@ const ORT_ENV_GPU: &str = "ORT_USE_CUDA";
 /// Subdirectory (of the 'target' directory) into which to extract the prebuilt library.
 const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
+// default for cargo ndk is 21 but for the build script it is 27
+// both need to be the same otherwise linking might fail
+const ANDROID_API_LEVEL: u32 = 21;
+
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
     println!("Build script disabled!");
@@ -461,7 +465,7 @@ fn prepare_libort_dir() -> PathBuf {
 
     match strategy.as_ref().map(String::as_str) {
         Err(_) => match os.as_str() {
-            "android" => android::compile(),
+            "android" => android::setup(),
             _ => prepare_libort_dir_prebuilt(),
         },
         Ok("download") => prepare_libort_dir_prebuilt(),
@@ -474,21 +478,66 @@ fn prepare_libort_dir() -> PathBuf {
                 );
             }
         }),
-        Ok("compile") => android::compile(),
+        Ok("compile") => unimplemented!(),
         _ => panic!("Unknown value for {:?}", ORT_ENV_STRATEGY),
     }
 }
 
 pub mod android {
-    use std::{env, fs, path::PathBuf, process::Command, str::FromStr};
+    use std::{env, fs, io::Read, path::PathBuf, process::Command, str::FromStr};
 
     use git2::{ErrorCode, Repository};
 
-    use crate::{ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
+    use crate::{ANDROID_API_LEVEL, ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
 
-    pub fn compile() -> PathBuf {
+    pub type GenericError = Box<dyn std::error::Error + Sync + Send + 'static>;
+
+    struct Target {
+        os: OS,
+        arch: Arch,
+    }
+
+    pub fn setup() -> PathBuf {
+        let os = env::var("CARGO_CFG_TARGET_OS")
+            .map(|s| OS::from_str(&s))
+            .expect("Failed to get TARGET_OS")
+            .expect("Failed to get TARGET_OS");
+
+        let arch = env::var("CARGO_CFG_TARGET_ARCH")
+            .map(|s| Arch::from_str(&s))
+            .expect("Failed to get TARGET_ARCH")
+            .expect("Failed to get TARGET_ARCH");
+
+        let target = Target { os, arch };
+        download_prebuilt(&target).unwrap_or_else(|_| compile(&target))
+    }
+
+    fn compile(target: &Target) -> PathBuf {
         let workdir = prepare_git_repository();
-        build_target(&workdir)
+        build_target(&workdir, target)
+    }
+
+    fn download_prebuilt(target: &Target) -> Result<PathBuf, GenericError> {
+        let base = "http://s3-de-central.profitbricks.com/xayn-yellow-bert/onnxruntime";
+        let url = format!(
+            "{}/{}/libonnxruntime.so",
+            base,
+            version_name(&target.os, &target.arch)
+        );
+
+        let mut resp = ureq::get(&url).call()?.into_reader();
+        let mut buf = Vec::new();
+        resp.read_to_end(&mut buf)
+            .expect("Failed to read the content of the request");
+
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        let workdir = out_dir.join(format!("{}-download", ORT_PREBUILT_EXTRACT_DIR));
+        let lib_dir = workdir.join("lib");
+        fs::create_dir_all(&lib_dir).expect("Failed to create library directory");
+        fs::write(&lib_dir.join("libonnxruntime.so"), buf)
+            .expect("Failed to write content into file");
+
+        Ok(workdir)
     }
 
     fn prepare_git_repository() -> PathBuf {
@@ -525,36 +574,16 @@ pub mod android {
             .into()
     }
 
-    fn build_target(workdir: &PathBuf) -> PathBuf {
-        let os = env::var("CARGO_CFG_TARGET_OS")
-            .map(|s| OS::from_str(&s))
-            .expect("Failed to get TARGET_OS")
-            .expect("Failed to get TARGET_OS");
-
-        let arch = env::var("CARGO_CFG_TARGET_ARCH")
-            .map(|s| Arch::from_str(&s))
-            .expect("Failed to get TARGET_ARCH")
-            .expect("Failed to get TARGET_ARCH");
-
-        // default for cargo ndk is 21 but for the build script it is 27
-        // both need to be the same otherwise linking might fail
-        let api_level = 21;
-
+    fn build_target(workdir: &PathBuf, target: &Target) -> PathBuf {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let release_dir = out_dir.join(format!("{}-release", ORT_PREBUILT_EXTRACT_DIR));
-        let version_dir = release_dir.join(format!(
-            "{}-{}-lvl-{}-v{}",
-            os.to_string(),
-            arch.to_string(),
-            api_level,
-            ORT_VERSION
-        ));
+        let version_dir = release_dir.join(version_name(&target.os, &target.arch));
 
-        build_android(workdir, &version_dir, &arch, api_level);
+        build_android(workdir, &version_dir, &target.arch);
         version_dir
     }
 
-    fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch, api_level: u32) {
+    fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
         let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
         let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
 
@@ -570,9 +599,11 @@ pub mod android {
                 .arg("--android_abi")
                 .arg(arch.as_android_arch())
                 .arg("--android_api")
-                .arg(api_level.to_string())
+                .arg(ANDROID_API_LEVEL.to_string())
                 .arg("--parallel")
                 .arg("0")
+                // don't run x84_64 tests on android emulator
+                .arg("--skip_tests")
                 .arg("--build_shared_lib")
                 .arg("--config")
                 .arg("Release")
@@ -586,6 +617,16 @@ pub mod android {
             }
             mimic_release_package(workdir, version_dir, &OS::Android);
         }
+    }
+
+    fn version_name(os: &OS, arch: &Arch) -> String {
+        format!(
+            "{}-{}-lvl-{}-v{}",
+            os.to_string(),
+            arch.to_string(),
+            ANDROID_API_LEVEL,
+            ORT_VERSION
+        )
     }
 
     fn mimic_release_package(workdir: &PathBuf, version_dir: &PathBuf, os: &OS) {
