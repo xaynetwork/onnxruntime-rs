@@ -130,6 +130,15 @@ impl<'a> SessionBuilder<'a> {
         Ok(self)
     }
 
+    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    /// Enable nnapi
+    pub fn with_nnapi(self) -> Result<SessionBuilder<'a>> {
+        unsafe {
+            sys::OrtSessionOptionsAppendExecutionProvider_Nnapi(self.session_options_ptr, 0);
+        }
+        Ok(self)
+    }
+
     /// Set the session's allocator
     ///
     /// Defaults to [`AllocatorType::Arena`](../enum.AllocatorType.html#variant.Arena)

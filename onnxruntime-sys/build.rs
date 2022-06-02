@@ -36,7 +36,7 @@ const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
 // default for cargo ndk is 21 but for the build script it is 27
 // both need to be the same otherwise linking might fail
-const ANDROID_API_LEVEL: u32 = 21;
+const ANDROID_API_LEVEL: u32 = 27;
 
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
@@ -518,24 +518,29 @@ pub mod android {
     }
 
     fn download_prebuilt(target: &Target) -> Result<PathBuf, GenericError> {
-        let base = "http://s3-de-central.profitbricks.com/xayn-yellow-bert/onnxruntime";
-        let url = format!(
-            "{}/{}/libonnxruntime.so",
-            base,
-            version_name(&target.os, &target.arch)
-        );
-
-        let mut resp = ureq::get(&url).call()?.into_reader();
-        let mut buf = Vec::new();
-        resp.read_to_end(&mut buf)
-            .expect("Failed to read the content of the request");
-
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-        let workdir = out_dir.join(format!("{}-download", ORT_PREBUILT_EXTRACT_DIR));
+        let workdir = out_dir
+            .join(format!("{}-download", ORT_PREBUILT_EXTRACT_DIR))
+            .join(version_name(&target.os, &target.arch));
         let lib_dir = workdir.join("lib");
-        fs::create_dir_all(&lib_dir).expect("Failed to create library directory");
-        fs::write(&lib_dir.join("libonnxruntime.so"), buf)
-            .expect("Failed to write content into file");
+        let lib = lib_dir.join("libonnxruntime.so");
+
+        if !lib.exists() {
+            let base = "http://s3-de-central.profitbricks.com/xayn-yellow-bert/onnxruntime";
+            let url = format!(
+                "{}/{}/libonnxruntime.so",
+                base,
+                version_name(&target.os, &target.arch)
+            );
+
+            let mut resp = ureq::get(&url).call()?.into_reader();
+            let mut buf = Vec::new();
+            resp.read_to_end(&mut buf)
+                .expect("Failed to read the content of the request");
+
+            fs::create_dir_all(&lib_dir).expect("Failed to create library directory");
+            fs::write(lib, buf).expect("Failed to write content into file");
+        }
 
         Ok(workdir)
     }
@@ -586,10 +591,14 @@ pub mod android {
     fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
         let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
         let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
+        let with_nnapi = env::var("ANDROID_NNAPI").ok();
+        if with_nnapi.is_some() && ANDROID_API_LEVEL < 27 {
+            panic!("nnapi requires no less than api level 27")
+        }
 
         if !version_dir.exists() {
-            let status = Command::new("sh")
-                .current_dir(&workdir)
+            let mut cmd = Command::new("sh");
+            cmd.current_dir(&workdir)
                 .arg("build.sh")
                 .arg("--android")
                 .arg("--android_sdk_path")
@@ -599,23 +608,28 @@ pub mod android {
                 .arg("--android_abi")
                 .arg(arch.as_android_arch())
                 .arg("--android_api")
-                .arg(ANDROID_API_LEVEL.to_string())
-                .arg("--parallel")
+                .arg(ANDROID_API_LEVEL.to_string());
+
+            if with_nnapi.is_some() {
+                cmd.arg("--use_nnapi");
+            }
+
+            cmd.arg("--parallel")
                 .arg("0")
                 // don't run x84_64 tests on android emulator
                 .arg("--skip_tests")
                 .arg("--build_shared_lib")
                 .arg("--config")
-                .arg("Release")
-                .status()
-                .expect("Process failed to execute");
+                .arg("Release");
+
+            let status = cmd.status().expect("Process failed to execute");
             if !status.success() {
                 panic!(
                     "Failed to build android library for target {}",
                     arch.to_string()
                 )
             }
-            mimic_release_package(workdir, version_dir, &OS::Android);
+            mimic_release_package(workdir, version_dir, &OS::Android, with_nnapi.is_some());
         }
     }
 
@@ -629,7 +643,12 @@ pub mod android {
         )
     }
 
-    fn mimic_release_package(workdir: &PathBuf, version_dir: &PathBuf, os: &OS) {
+    fn mimic_release_package(
+        workdir: &PathBuf,
+        version_dir: &PathBuf,
+        os: &OS,
+        with_extra_provider: bool,
+    ) {
         fs::create_dir_all(version_dir).expect("Failed to create release directory");
         let build_dir = workdir
             .join("build")
@@ -699,6 +718,21 @@ pub mod android {
             include_target_dir.join("provider_options.h"),
         )
         .unwrap();
+
+        if with_extra_provider {
+            match os {
+                OS::Android => {
+                    fs::copy(
+                        include_source_base
+                            .join("providers")
+                            .join("nnapi")
+                            .join("nnapi_provider_factory.h"),
+                        include_target_dir.join("nnapi_provider_factory.h"),
+                    )
+                    .unwrap();
+                }
+            }
+        }
     }
 
     #[allow(non_camel_case_types)]
