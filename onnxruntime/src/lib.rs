@@ -344,6 +344,24 @@ impl From<GraphOptimizationLevel> for sys::GraphOptimizationLevel {
     }
 }
 
+#[derive(Debug)]
+#[cfg_attr(not(windows), repr(u32))]
+#[cfg_attr(windows, repr(i32))]
+pub enum ExecutionMode {
+    Sequential = sys::ExecutionMode::ORT_SEQUENTIAL as OnnxEnumInt,
+    Parallel = sys::ExecutionMode::ORT_PARALLEL as OnnxEnumInt,
+}
+
+impl From<ExecutionMode> for sys::ExecutionMode {
+    fn from(val: ExecutionMode) -> Self {
+        use ExecutionMode::*;
+        match val {
+            Sequential => sys::ExecutionMode::ORT_SEQUENTIAL,
+            Parallel => sys::ExecutionMode::ORT_PARALLEL,
+        }
+    }
+}
+
 // FIXME: Use https://docs.rs/bindgen/0.54.1/bindgen/struct.Builder.html#method.rustified_enum
 // FIXME: Add tests to cover the commented out types
 /// Enum mapping ONNX Runtime's supported tensor types
