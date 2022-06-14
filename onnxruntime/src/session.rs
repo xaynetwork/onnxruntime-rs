@@ -159,6 +159,15 @@ impl SessionBuilder {
         Ok(self)
     }
 
+    #[cfg(all(target_os = "ios", target_arch = "aarch64"))]
+    /// Enable coreml
+    pub fn with_coreml(self) -> Result<SessionBuilder> {
+        unsafe {
+            sys::OrtSessionOptionsAppendExecutionProvider_CoreML(self.session_options_ptr, 0);
+        }
+        Ok(self)
+    }
+
     /// Set the session's allocator
     ///
     /// Defaults to [`AllocatorType::Arena`](../enum.AllocatorType.html#variant.Arena)

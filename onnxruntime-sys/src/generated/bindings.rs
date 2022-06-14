@@ -51,3 +51,15 @@ include!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/generated/android/x86_64/bindings.rs"
 ));
+
+#[cfg(all(target_os = "ios", target_arch = "aarch64"))]
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/generated/ios/aarch64/bindings.rs"
+));
+
+// #[cfg(all(target_os = "ios", target_arch = "x86_64"))]
+// include!(concat!(
+//     env!("CARGO_MANIFEST_DIR"),
+//     "/src/generated/ios/x86_64/bindings.rs"
+// ));

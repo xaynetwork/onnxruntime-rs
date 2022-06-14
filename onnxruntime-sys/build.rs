@@ -38,6 +38,8 @@ const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 // both need to be the same otherwise linking might fail
 const ANDROID_API_LEVEL: u32 = 27;
 
+const IOS_API_LEVEL: u32 = 13;
+
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
     println!("Build script disabled!");
@@ -169,7 +171,7 @@ fn generate_bindings(include_dir: &Path) {
     println!("cargo:rerun-if-changed={:?}", generated_file);
     bindings
         .write_to_file(&generated_file)
-        .expect("Couldn't write bindings!");
+        .expect(&format!("Couldn't write bindings! {:?}", generated_file));
 }
 
 fn download<P>(source_url: &str, target_file: P)
@@ -465,7 +467,7 @@ fn prepare_libort_dir() -> PathBuf {
 
     match strategy.as_ref().map(String::as_str) {
         Err(_) => match os.as_str() {
-            "android" => android::setup(),
+            "android" | "ios" => mobile::setup(),
             _ => prepare_libort_dir_prebuilt(),
         },
         Ok("download") => prepare_libort_dir_prebuilt(),
@@ -483,12 +485,12 @@ fn prepare_libort_dir() -> PathBuf {
     }
 }
 
-pub mod android {
+pub mod mobile {
     use std::{env, fs, io::Read, path::PathBuf, process::Command, str::FromStr};
 
     use git2::{ErrorCode, Repository};
 
-    use crate::{ANDROID_API_LEVEL, ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
+    use crate::{ANDROID_API_LEVEL, IOS_API_LEVEL, ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
 
     pub type GenericError = Box<dyn std::error::Error + Sync + Send + 'static>;
 
@@ -523,14 +525,15 @@ pub mod android {
             .join(format!("{}-download", ORT_PREBUILT_EXTRACT_DIR))
             .join(version_name(&target.os, &target.arch));
         let lib_dir = workdir.join("lib");
-        let lib = lib_dir.join("libonnxruntime.so");
+        let lib = lib_dir.join(lib_name(&target.os));
 
         if !lib.exists() {
             let base = "http://s3-de-central.profitbricks.com/xayn-yellow-bert/onnxruntime";
             let url = format!(
-                "{}/{}/libonnxruntime.so",
+                "{}/{}/{}",
                 base,
-                version_name(&target.os, &target.arch)
+                version_name(&target.os, &target.arch),
+                lib_name(&target.os)
             );
 
             let mut resp = ureq::get(&url).call()?.into_reader();
@@ -584,8 +587,60 @@ pub mod android {
         let release_dir = out_dir.join(format!("{}-release", ORT_PREBUILT_EXTRACT_DIR));
         let version_dir = release_dir.join(version_name(&target.os, &target.arch));
 
-        build_android(workdir, &version_dir, &target.arch);
+        match &target.os {
+            OS::Android => build_android(workdir, &version_dir, &target.arch),
+            OS::iOS => build_ios(workdir, &version_dir, &target.arch),
+        };
         version_dir
+    }
+
+    fn build_ios(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
+        let with_coreml = env::var("IOS_COREML").ok();
+        if with_coreml.is_some() && IOS_API_LEVEL < 13 {
+            panic!("coreml requires no less than api level 13")
+        }
+
+        if !version_dir.exists() {
+            let mut cmd = Command::new("sh");
+            cmd.current_dir(&workdir)
+                .arg("build.sh")
+                .arg("--use_xcode")
+                .arg("--ios")
+                .arg("--ios_sysroot");
+
+            let sdk = match arch {
+                Arch::x86_64 => "iphonesimulator",
+                Arch::aarch64 => "iphoneos",
+                _ => panic!("unsupported arch"),
+            };
+
+            cmd.arg(sdk)
+                .arg("--osx_arch")
+                .arg(arch.as_ios_arch())
+                .arg("--apple_deploy_target")
+                .arg(IOS_API_LEVEL.to_string());
+
+            if with_coreml.is_some() {
+                cmd.arg("--use_coreml");
+            }
+
+            cmd.arg("--parallel")
+                .arg("0")
+                // don't run x84_64 tests on android emulator
+                .arg("--skip_tests")
+                .arg("--build_apple_framework")
+                .arg("--config")
+                .arg("Release");
+
+            let status = cmd.status().expect("Process failed to execute");
+            if !status.success() {
+                panic!(
+                    "Failed to build android library for target {}",
+                    arch.to_string()
+                )
+            }
+            mimic_release_package(workdir, version_dir, &OS::iOS, with_coreml.is_some());
+        }
     }
 
     fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
@@ -634,11 +689,16 @@ pub mod android {
     }
 
     fn version_name(os: &OS, arch: &Arch) -> String {
+        let api_lvl = match os {
+            OS::Android => ANDROID_API_LEVEL,
+            OS::iOS => IOS_API_LEVEL,
+        };
+
         format!(
             "{}-{}-lvl-{}-v{}",
             os.to_string(),
             arch.to_string(),
-            ANDROID_API_LEVEL,
+            api_lvl,
             ORT_VERSION
         )
     }
@@ -655,11 +715,27 @@ pub mod android {
             .join(os.as_build_name())
             .join("Release");
 
+        let build_dir = if let OS::iOS = os {
+            build_dir
+                .join(format!("Release-{}", "iphoneos" /*  FIXME */))
+                .join("static_framework")
+                .join("onnxruntime.framework")
+        } else {
+            build_dir
+        };
+
         let lib_target_dir = version_dir.join("lib");
         fs::create_dir(&lib_target_dir).unwrap();
+
+        let generated_lib_name = if let OS::iOS = os {
+            "onnxruntime"
+        } else {
+            lib_name(os)
+        };
+
         fs::copy(
-            build_dir.join("libonnxruntime.so"),
-            lib_target_dir.join("libonnxruntime.so"),
+            build_dir.join(generated_lib_name),
+            lib_target_dir.join(lib_name(os)),
         )
         .unwrap();
 
@@ -719,31 +795,43 @@ pub mod android {
         )
         .unwrap();
 
-        if with_extra_provider {
-            match os {
-                OS::Android => {
-                    fs::copy(
-                        include_source_base
-                            .join("providers")
-                            .join("nnapi")
-                            .join("nnapi_provider_factory.h"),
-                        include_target_dir.join("nnapi_provider_factory.h"),
-                    )
-                    .unwrap();
-                }
-            }
+        fs::copy(
+            include_source_base
+                .join("providers")
+                .join("nnapi")
+                .join("nnapi_provider_factory.h"),
+            include_target_dir.join("nnapi_provider_factory.h"),
+        )
+        .unwrap();
+
+        fs::copy(
+            include_source_base
+                .join("providers")
+                .join("coreml")
+                .join("coreml_provider_factory.h"),
+            include_target_dir.join("coreml_provider_factory.h"),
+        )
+        .unwrap();
+    }
+
+    fn lib_name(os: &OS) -> &str {
+        match os {
+            OS::Android => "libonnxruntime.so",
+            OS::iOS => "libonnxruntime.a",
         }
     }
 
     #[allow(non_camel_case_types)]
     enum OS {
         Android,
+        iOS,
     }
 
     impl ToString for OS {
         fn to_string(&self) -> String {
             match self {
                 OS::Android => "android",
+                OS::iOS => "ios",
             }
             .to_string()
         }
@@ -755,6 +843,7 @@ pub mod android {
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
                 "android" => Ok(OS::Android),
+                "ios" => Ok(OS::iOS),
                 _ => Err(format!("unsupported os: {}", s)),
             }
         }
@@ -764,6 +853,7 @@ pub mod android {
         fn as_build_name(&self) -> &str {
             match self {
                 OS::Android => "Android",
+                OS::iOS => "iOS",
             }
         }
     }
@@ -818,6 +908,14 @@ pub mod android {
                 Arch::x86_64 => "x86_64-linux-android",
                 Arch::arm => "arm-linux-androideabi",
                 Arch::aarch64 => "aarch64-linux-android",
+            }
+        }
+
+        fn as_ios_arch(&self) -> &str {
+            match self {
+                Arch::x86_64 => "x86_64",
+                Arch::aarch64 => "arm64",
+                _ => panic!("unsupported arch"),
             }
         }
     }
