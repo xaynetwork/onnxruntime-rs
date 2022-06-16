@@ -19,7 +19,7 @@ keywords = ["neuralnetworks", "onnx", "bindings"]
 [build-dependencies]
 bindgen = { version = "0.59", optional = true }
 ureq = "2.1"
-git2 = "0.14.4"
+git2 = { version = "0.14.4", optional = true }
 
 # Used on Windows
 zip = "0.5"
@@ -37,6 +37,7 @@ disable-sys-build-script = []
 generate-bindings = ["bindgen"]
 coreml = []
 nnapi = []
+compile = ["git2"]
 
 [package.metadata.docs.rs]
 # Disable the build.rs on https://docs.rs since it can cause

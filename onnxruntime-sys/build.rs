@@ -492,8 +492,11 @@ fn prepare_libort_dir() -> PathBuf {
 }
 
 pub mod mobile {
-    use std::{env, fs, io::Read, path::PathBuf, process::Command, str::FromStr};
+    #[cfg(feature = "compile")]
+    use std::process::Command;
+    use std::{env, fs, io::Read, path::PathBuf, str::FromStr};
 
+    #[cfg(feature = "compile")]
     use git2::{ErrorCode, Repository};
 
     use crate::{ANDROID_API_LEVEL, IOS_API_LEVEL, ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
@@ -517,9 +520,18 @@ pub mod mobile {
             .expect("Failed to get TARGET_ARCH");
 
         let target = Target { os, arch };
-        download_prebuilt(&target).unwrap_or_else(|_| compile(&target))
+        download_prebuilt(&target).unwrap_or_else(|_| {
+            #[cfg(feature = "compile")]
+            {
+                compile(&target)
+            }
+            #[cfg(not(feature = "compile"))]
+            {
+                panic!("enable the compile flag")
+            }
+        })
     }
-
+    #[cfg(feature = "compile")]
     fn compile(target: &Target) -> PathBuf {
         let workdir = prepare_git_repository();
         build_target(&workdir, target)
@@ -554,6 +566,7 @@ pub mod mobile {
         Ok(workdir)
     }
 
+    #[cfg(feature = "compile")]
     fn prepare_git_repository() -> PathBuf {
         const REPO_URL: &str = "https://github.com/microsoft/onnxruntime";
 
@@ -589,6 +602,7 @@ pub mod mobile {
             .into()
     }
 
+    #[cfg(feature = "compile")]
     fn build_target(workdir: &PathBuf, target: &Target) -> PathBuf {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let release_dir = out_dir.join(format!("{}-release", ORT_PREBUILT_EXTRACT_DIR));
@@ -601,6 +615,7 @@ pub mod mobile {
         version_dir
     }
 
+    #[cfg(feature = "compile")]
     fn build_ios(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
         if !version_dir.exists() {
             let mut cmd = Command::new("sh");
@@ -644,6 +659,7 @@ pub mod mobile {
         }
     }
 
+    #[cfg(feature = "compile")]
     fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
         let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
         let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
@@ -700,6 +716,7 @@ pub mod mobile {
         )
     }
 
+    #[cfg(feature = "compile")]
     fn mimic_release_package(workdir: &PathBuf, version_dir: &PathBuf, os: &OS) {
         fs::create_dir_all(version_dir).expect("Failed to create release directory");
         let build_dir = workdir
