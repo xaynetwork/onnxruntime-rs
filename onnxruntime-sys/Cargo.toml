@@ -35,6 +35,8 @@ default = []
 disable-sys-build-script = []
 # Use bindgen to generate bindings in build.rs
 generate-bindings = ["bindgen"]
+coreml = []
+nnapi = []
 
 [package.metadata.docs.rs]
 # Disable the build.rs on https://docs.rs since it can cause

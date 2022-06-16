@@ -36,9 +36,15 @@ const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
 // default for cargo ndk is 21 but for the build script it is 27
 // both need to be the same otherwise linking might fail
+#[cfg(feature = "nnapi")]
 const ANDROID_API_LEVEL: u32 = 27;
+#[cfg(not(feature = "nnapi"))]
+const ANDROID_API_LEVEL: u32 = 21;
 
+#[cfg(feature = "coreml")]
 const IOS_API_LEVEL: u32 = 13;
+#[cfg(not(feature = "coreml"))]
+const IOS_API_LEVEL: u32 = 11;
 
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
@@ -564,6 +570,7 @@ pub mod mobile {
 
         let (object, reference) = repo
             .revparse_ext(&format!("v{}", ORT_VERSION))
+            // .revparse_ext("453c57f92f5294417f69d81a240484b7d59938f2")
             .expect("Object not found");
 
         repo.checkout_tree(&object, None)
@@ -595,11 +602,6 @@ pub mod mobile {
     }
 
     fn build_ios(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
-        let with_coreml = env::var("IOS_COREML").ok();
-        if with_coreml.is_some() && IOS_API_LEVEL < 13 {
-            panic!("coreml requires no less than api level 13")
-        }
-
         if !version_dir.exists() {
             let mut cmd = Command::new("sh");
             cmd.current_dir(&workdir)
@@ -618,38 +620,33 @@ pub mod mobile {
                 .arg("--osx_arch")
                 .arg(arch.as_ios_arch())
                 .arg("--apple_deploy_target")
-                .arg(IOS_API_LEVEL.to_string());
+                .arg(IOS_API_LEVEL.to_string())
+                .arg("--build_apple_framework");
 
-            if with_coreml.is_some() {
+            if cfg!(feature = "coreml") {
                 cmd.arg("--use_coreml");
             }
 
             cmd.arg("--parallel")
                 .arg("0")
-                // don't run x84_64 tests on android emulator
                 .arg("--skip_tests")
-                .arg("--build_apple_framework")
                 .arg("--config")
                 .arg("Release");
 
             let status = cmd.status().expect("Process failed to execute");
             if !status.success() {
                 panic!(
-                    "Failed to build android library for target {}",
+                    "Failed to build ios library for target {}",
                     arch.to_string()
                 )
             }
-            mimic_release_package(workdir, version_dir, &OS::iOS, with_coreml.is_some());
+            mimic_release_package(workdir, version_dir, &OS::iOS);
         }
     }
 
     fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
         let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
         let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
-        let with_nnapi = env::var("ANDROID_NNAPI").ok();
-        if with_nnapi.is_some() && ANDROID_API_LEVEL < 27 {
-            panic!("nnapi requires no less than api level 27")
-        }
 
         if !version_dir.exists() {
             let mut cmd = Command::new("sh");
@@ -665,7 +662,7 @@ pub mod mobile {
                 .arg("--android_api")
                 .arg(ANDROID_API_LEVEL.to_string());
 
-            if with_nnapi.is_some() {
+            if cfg!(feature = "nnapi") {
                 cmd.arg("--use_nnapi");
             }
 
@@ -684,7 +681,7 @@ pub mod mobile {
                     arch.to_string()
                 )
             }
-            mimic_release_package(workdir, version_dir, &OS::Android, with_nnapi.is_some());
+            mimic_release_package(workdir, version_dir, &OS::Android);
         }
     }
 
@@ -703,12 +700,7 @@ pub mod mobile {
         )
     }
 
-    fn mimic_release_package(
-        workdir: &PathBuf,
-        version_dir: &PathBuf,
-        os: &OS,
-        with_extra_provider: bool,
-    ) {
+    fn mimic_release_package(workdir: &PathBuf, version_dir: &PathBuf, os: &OS) {
         fs::create_dir_all(version_dir).expect("Failed to create release directory");
         let build_dir = workdir
             .join("build")
