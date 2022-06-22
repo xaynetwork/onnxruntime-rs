@@ -150,7 +150,7 @@ impl SessionBuilder {
         Ok(self)
     }
 
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "android"))]
     /// Enable nnapi
     pub fn with_nnapi(self) -> Result<SessionBuilder> {
         unsafe {
