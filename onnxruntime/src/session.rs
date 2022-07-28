@@ -150,11 +150,20 @@ impl SessionBuilder {
         Ok(self)
     }
 
-    #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+    #[cfg(all(target_os = "android"))]
     /// Enable nnapi
     pub fn with_nnapi(self) -> Result<SessionBuilder> {
         unsafe {
             sys::OrtSessionOptionsAppendExecutionProvider_Nnapi(self.session_options_ptr, 0);
+        }
+        Ok(self)
+    }
+
+    #[cfg(all(target_os = "ios", target_arch = "aarch64"))]
+    /// Enable coreml
+    pub fn with_coreml(self) -> Result<SessionBuilder> {
+        unsafe {
+            sys::OrtSessionOptionsAppendExecutionProvider_CoreML(self.session_options_ptr, 0);
         }
         Ok(self)
     }

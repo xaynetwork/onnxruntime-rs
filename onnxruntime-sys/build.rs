@@ -36,7 +36,15 @@ const ORT_PREBUILT_EXTRACT_DIR: &str = "onnxruntime";
 
 // default for cargo ndk is 21 but for the build script it is 27
 // both need to be the same otherwise linking might fail
+#[cfg(feature = "nnapi")]
 const ANDROID_API_LEVEL: u32 = 27;
+#[cfg(not(feature = "nnapi"))]
+const ANDROID_API_LEVEL: u32 = 21;
+
+#[cfg(feature = "coreml")]
+const IOS_API_LEVEL: u32 = 13;
+#[cfg(not(feature = "coreml"))]
+const IOS_API_LEVEL: u32 = 11;
 
 #[cfg(feature = "disable-sys-build-script")]
 fn main() {
@@ -169,7 +177,7 @@ fn generate_bindings(include_dir: &Path) {
     println!("cargo:rerun-if-changed={:?}", generated_file);
     bindings
         .write_to_file(&generated_file)
-        .expect("Couldn't write bindings!");
+        .expect(&format!("Couldn't write bindings! {:?}", generated_file));
 }
 
 fn download<P>(source_url: &str, target_file: P)
@@ -359,11 +367,13 @@ impl OnnxPrebuiltArchive for Triplet {
             // onnxruntime-win-arm64-1.8.1.zip
             // onnxruntime-linux-x64-1.8.1.tgz
             // onnxruntime-osx-x64-1.8.1.tgz
+            (Os::Linux, Architecture::X86_64, Accelerator::None) => {
+                Cow::from(format!("{}-x64", self.os.as_onnx_str()))
+            }
             (Os::Windows, Architecture::X86, Accelerator::None)
             | (Os::Windows, Architecture::X86_64, Accelerator::None)
             | (Os::Windows, Architecture::Arm, Accelerator::None)
             | (Os::Windows, Architecture::Arm64, Accelerator::None)
-            | (Os::Linux, Architecture::X86_64, Accelerator::None)
             | (Os::MacOs, Architecture::X86_64, Accelerator::None) => Cow::from(format!(
                 "{}-{}",
                 self.os.as_onnx_str(),
@@ -465,7 +475,7 @@ fn prepare_libort_dir() -> PathBuf {
 
     match strategy.as_ref().map(String::as_str) {
         Err(_) => match os.as_str() {
-            "android" => android::setup(),
+            "android" | "ios" => mobile::setup(),
             _ => prepare_libort_dir_prebuilt(),
         },
         Ok("download") => prepare_libort_dir_prebuilt(),
@@ -483,12 +493,15 @@ fn prepare_libort_dir() -> PathBuf {
     }
 }
 
-pub mod android {
-    use std::{env, fs, io::Read, path::PathBuf, process::Command, str::FromStr};
+pub mod mobile {
+    #[cfg(feature = "compile")]
+    use std::process::Command;
+    use std::{env, fs, io::Read, path::PathBuf, str::FromStr};
 
+    #[cfg(feature = "compile")]
     use git2::{ErrorCode, Repository};
 
-    use crate::{ANDROID_API_LEVEL, ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
+    use crate::{ANDROID_API_LEVEL, IOS_API_LEVEL, ORT_PREBUILT_EXTRACT_DIR, ORT_VERSION};
 
     pub type GenericError = Box<dyn std::error::Error + Sync + Send + 'static>;
 
@@ -509,9 +522,18 @@ pub mod android {
             .expect("Failed to get TARGET_ARCH");
 
         let target = Target { os, arch };
-        download_prebuilt(&target).unwrap_or_else(|_| compile(&target))
+        download_prebuilt(&target).unwrap_or_else(|_| {
+            #[cfg(feature = "compile")]
+            {
+                compile(&target)
+            }
+            #[cfg(not(feature = "compile"))]
+            {
+                panic!("enable the compile flag")
+            }
+        })
     }
-
+    #[cfg(feature = "compile")]
     fn compile(target: &Target) -> PathBuf {
         let workdir = prepare_git_repository();
         build_target(&workdir, target)
@@ -523,14 +545,15 @@ pub mod android {
             .join(format!("{}-download", ORT_PREBUILT_EXTRACT_DIR))
             .join(version_name(&target.os, &target.arch));
         let lib_dir = workdir.join("lib");
-        let lib = lib_dir.join("libonnxruntime.so");
+        let lib = lib_dir.join(lib_name(&target.os));
 
         if !lib.exists() {
             let base = "http://s3-de-central.profitbricks.com/xayn-yellow-bert/onnxruntime";
             let url = format!(
-                "{}/{}/libonnxruntime.so",
+                "{}/{}/{}",
                 base,
-                version_name(&target.os, &target.arch)
+                version_name(&target.os, &target.arch),
+                lib_name(&target.os)
             );
 
             let mut resp = ureq::get(&url).call()?.into_reader();
@@ -545,6 +568,7 @@ pub mod android {
         Ok(workdir)
     }
 
+    #[cfg(feature = "compile")]
     fn prepare_git_repository() -> PathBuf {
         const REPO_URL: &str = "https://github.com/microsoft/onnxruntime";
 
@@ -561,6 +585,7 @@ pub mod android {
 
         let (object, reference) = repo
             .revparse_ext(&format!("v{}", ORT_VERSION))
+            // .revparse_ext("453c57f92f5294417f69d81a240484b7d59938f2")
             .expect("Object not found");
 
         repo.checkout_tree(&object, None)
@@ -579,22 +604,67 @@ pub mod android {
             .into()
     }
 
+    #[cfg(feature = "compile")]
     fn build_target(workdir: &PathBuf, target: &Target) -> PathBuf {
         let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
         let release_dir = out_dir.join(format!("{}-release", ORT_PREBUILT_EXTRACT_DIR));
         let version_dir = release_dir.join(version_name(&target.os, &target.arch));
 
-        build_android(workdir, &version_dir, &target.arch);
+        match &target.os {
+            OS::Android => build_android(workdir, &version_dir, &target.arch),
+            OS::iOS => build_ios(workdir, &version_dir, &target.arch),
+        };
         version_dir
     }
 
+    #[cfg(feature = "compile")]
+    fn build_ios(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
+        if !version_dir.exists() {
+            let mut cmd = Command::new("sh");
+            cmd.current_dir(&workdir)
+                .arg("build.sh")
+                .arg("--use_xcode")
+                .arg("--ios")
+                .arg("--ios_sysroot");
+
+            let sdk = match arch {
+                Arch::x86_64 => "iphonesimulator",
+                Arch::aarch64 => "iphoneos",
+                _ => panic!("unsupported arch"),
+            };
+
+            cmd.arg(sdk)
+                .arg("--osx_arch")
+                .arg(arch.as_ios_arch())
+                .arg("--apple_deploy_target")
+                .arg(IOS_API_LEVEL.to_string())
+                .arg("--build_apple_framework");
+
+            if cfg!(feature = "coreml") {
+                cmd.arg("--use_coreml");
+            }
+
+            cmd.arg("--parallel")
+                .arg("0")
+                .arg("--skip_tests")
+                .arg("--config")
+                .arg("Release");
+
+            let status = cmd.status().expect("Process failed to execute");
+            if !status.success() {
+                panic!(
+                    "Failed to build ios library for target {}",
+                    arch.to_string()
+                )
+            }
+            mimic_release_package(workdir, version_dir, &OS::iOS);
+        }
+    }
+
+    #[cfg(feature = "compile")]
     fn build_android(workdir: &PathBuf, version_dir: &PathBuf, arch: &Arch) {
         let sdk = env::var("ANDROID_SDK_HOME").expect("Failed to get ANDROID_SDK_HOME");
         let ndk = env::var("ANDROID_NDK_HOME").expect("Failed to get ANDROID_NDK_HOME");
-        let with_nnapi = env::var("ANDROID_NNAPI").ok();
-        if with_nnapi.is_some() && ANDROID_API_LEVEL < 27 {
-            panic!("nnapi requires no less than api level 27")
-        }
 
         if !version_dir.exists() {
             let mut cmd = Command::new("sh");
@@ -610,7 +680,7 @@ pub mod android {
                 .arg("--android_api")
                 .arg(ANDROID_API_LEVEL.to_string());
 
-            if with_nnapi.is_some() {
+            if cfg!(feature = "nnapi") {
                 cmd.arg("--use_nnapi");
             }
 
@@ -629,37 +699,54 @@ pub mod android {
                     arch.to_string()
                 )
             }
-            mimic_release_package(workdir, version_dir, &OS::Android, with_nnapi.is_some());
+            mimic_release_package(workdir, version_dir, &OS::Android);
         }
     }
 
     fn version_name(os: &OS, arch: &Arch) -> String {
+        let api_lvl = match os {
+            OS::Android => ANDROID_API_LEVEL,
+            OS::iOS => IOS_API_LEVEL,
+        };
+
         format!(
             "{}-{}-lvl-{}-v{}",
             os.to_string(),
             arch.to_string(),
-            ANDROID_API_LEVEL,
+            api_lvl,
             ORT_VERSION
         )
     }
 
-    fn mimic_release_package(
-        workdir: &PathBuf,
-        version_dir: &PathBuf,
-        os: &OS,
-        with_extra_provider: bool,
-    ) {
+    #[cfg(feature = "compile")]
+    fn mimic_release_package(workdir: &PathBuf, version_dir: &PathBuf, os: &OS) {
         fs::create_dir_all(version_dir).expect("Failed to create release directory");
         let build_dir = workdir
             .join("build")
             .join(os.as_build_name())
             .join("Release");
 
+        let build_dir = if let OS::iOS = os {
+            build_dir
+                .join(format!("Release-{}", "iphoneos" /*  FIXME */))
+                .join("static_framework")
+                .join("onnxruntime.framework")
+        } else {
+            build_dir
+        };
+
         let lib_target_dir = version_dir.join("lib");
         fs::create_dir(&lib_target_dir).unwrap();
+
+        let generated_lib_name = if let OS::iOS = os {
+            "onnxruntime"
+        } else {
+            lib_name(os)
+        };
+
         fs::copy(
-            build_dir.join("libonnxruntime.so"),
-            lib_target_dir.join("libonnxruntime.so"),
+            build_dir.join(generated_lib_name),
+            lib_target_dir.join(lib_name(os)),
         )
         .unwrap();
 
@@ -719,31 +806,43 @@ pub mod android {
         )
         .unwrap();
 
-        if with_extra_provider {
-            match os {
-                OS::Android => {
-                    fs::copy(
-                        include_source_base
-                            .join("providers")
-                            .join("nnapi")
-                            .join("nnapi_provider_factory.h"),
-                        include_target_dir.join("nnapi_provider_factory.h"),
-                    )
-                    .unwrap();
-                }
-            }
+        fs::copy(
+            include_source_base
+                .join("providers")
+                .join("nnapi")
+                .join("nnapi_provider_factory.h"),
+            include_target_dir.join("nnapi_provider_factory.h"),
+        )
+        .unwrap();
+
+        fs::copy(
+            include_source_base
+                .join("providers")
+                .join("coreml")
+                .join("coreml_provider_factory.h"),
+            include_target_dir.join("coreml_provider_factory.h"),
+        )
+        .unwrap();
+    }
+
+    fn lib_name(os: &OS) -> &str {
+        match os {
+            OS::Android => "libonnxruntime.so",
+            OS::iOS => "libonnxruntime.a",
         }
     }
 
     #[allow(non_camel_case_types)]
     enum OS {
         Android,
+        iOS,
     }
 
     impl ToString for OS {
         fn to_string(&self) -> String {
             match self {
                 OS::Android => "android",
+                OS::iOS => "ios",
             }
             .to_string()
         }
@@ -755,6 +854,7 @@ pub mod android {
         fn from_str(s: &str) -> Result<Self, Self::Err> {
             match s {
                 "android" => Ok(OS::Android),
+                "ios" => Ok(OS::iOS),
                 _ => Err(format!("unsupported os: {}", s)),
             }
         }
@@ -764,6 +864,7 @@ pub mod android {
         fn as_build_name(&self) -> &str {
             match self {
                 OS::Android => "Android",
+                OS::iOS => "iOS",
             }
         }
     }
@@ -818,6 +919,14 @@ pub mod android {
                 Arch::x86_64 => "x86_64-linux-android",
                 Arch::arm => "arm-linux-androideabi",
                 Arch::aarch64 => "aarch64-linux-android",
+            }
+        }
+
+        fn as_ios_arch(&self) -> &str {
+            match self {
+                Arch::x86_64 => "x86_64",
+                Arch::aarch64 => "arm64",
+                _ => panic!("unsupported arch"),
             }
         }
     }
